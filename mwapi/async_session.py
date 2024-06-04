@@ -40,7 +40,8 @@ class AsyncSession:
 
     def __init__(self, host, user_agent=None, formatversion=None,
                  api_path=None,
-                 timeout=None, session=None, **session_params):
+                 timeout=None, session=None, 
+                 force_http=False, max_redirects=10, **session_params):
         self.host = str(host)
         self.formatversion = int(formatversion) \
             if formatversion is not None else None
@@ -51,6 +52,8 @@ class AsyncSession:
         self.session = session or aiohttp.ClientSession()
         for key, value in session_params.items():
             setattr(self.session, key, value)
+        self.force_http = force_http
+        self.max_redirects = max_redirects
 
         self.headers = {}
 
@@ -62,7 +65,8 @@ class AsyncSession:
         else:
             self.headers['User-Agent'] = user_agent
 
-    async def _request(self, method, params=None, auth=None):
+    async def _request(self, method, params=None, auth=None, **request_params):
+        redirects = 0
         params = params or {}
         if self.formatversion is not None:
             params['formatversion'] = self.formatversion
@@ -77,26 +81,45 @@ class AsyncSession:
             params = params or {}
             params['format'] = "json"
 
-        try:
-            async with self.session.request(method=method, url=self.api_url,
-                                            params=params, data=data,
-                                            timeout=self.timeout,
-                                            headers=self.headers,
-                                            verify_ssl=True,
-                                            auth=auth) as resp:
+        if request_params:
+            for key, value in request_params.items():
+                logger.info("{0} = {1}".format(key, value))
 
-                doc = await resp.json()
+        try:
+            while True:
+                async with self.session.request(method=method, url=self.api_url,
+                                                params=params, data=data,
+                                                timeout=self.timeout,
+                                                headers=self.headers,
+                                                verify_ssl=True,
+                                                auth=auth,
+                                                **request_params) as resp:
+
+                    if resp.status in (301, 302, 303, 307, 308) and not request_params['allow_redirects']:
+                        redirects += 1
+                        if redirects >= self.max_redirects:
+                            raise TooManyRedirectsError
+                        redirect_url = resp.headers.get('Location')
+                        if self.force_http:
+                            redirect_url = redirect_url.replace("https://", "http://", 1)
+                        logger.info(f"Redirect to: {redirect_url}")
+                        self.api_url = redirect_url.split("?")[0]
+                        continue
+
+                    doc = await resp.json()
 
                 if 'error' in doc:
                     raise APIError.from_doc(doc['error'])
 
                 if 'warnings' in doc:
                     logger.warning("The following query raised warnings: {0}"
-                                   .format(params or data))
+                                .format(params or data))
                     for module, warning in doc['warnings'].items():
                         logger.warning("\t- {0} -- {1}"
-                                       .format(module, warning))
-                return doc
+                                    .format(module, warning))
+                
+                break
+            return doc
 
         except (ValueError, aiohttp.ContentTypeError):
             if resp is None:
@@ -104,7 +127,7 @@ class AsyncSession:
             else:
                 prefix = (await resp.text())[:350]
             raise ValueError("Could not decode as JSON:\n{0}"
-                             .format(prefix))
+                            .format(prefix))
         except (aiohttp.ServerTimeoutError,
                 asyncio.TimeoutError) as e:
             raise TimeoutError(str(e)) from e
@@ -117,7 +140,7 @@ class AsyncSession:
 
 
     async def request(self, method, params=None, query_continue=None,
-                      auth=None, continuation=False):
+                      auth=None, continuation=False, **request_params):
         """
         Sends an HTTP request to the API.
 
@@ -144,16 +167,16 @@ class AsyncSession:
         """
         normal_params = _normalize_params(params, query_continue)
         if continuation:
-            return self._continuation(method, params=normal_params, auth=auth)
+            return self._continuation(method, params=normal_params, auth=auth, **request_params)
         else:
-            return await self._request(method, params=normal_params, auth=auth)
+            return await self._request(method, params=normal_params, auth=auth, **request_params)
 
-    async def _continuation(self, method, params=None, auth=None):
+    async def _continuation(self, method, params=None, auth=None, **request_params):
         if "continue" not in params:
             params["continue"] = ""
 
         while True:
-            doc = await self._request(method, params=params, auth=auth)
+            doc = await self._request(method, params=params, auth=auth, **request_params)
             yield doc
             if "continue" not in doc:
                 break
@@ -161,7 +184,7 @@ class AsyncSession:
             params.update(doc["continue"])
 
     async def get(self, query_continue=None, auth=None, continuation=False,
-                  **params):
+                  request_params={}, **params):
         """Makes an API request with the GET method
 
         :Parameters:
@@ -184,10 +207,11 @@ class AsyncSession:
         """
         return await self.request("GET", params=params, auth=auth,
                                   query_continue=query_continue,
-                                  continuation=continuation)
+                                  continuation=continuation,
+                                  **request_params)
 
     async def post(self, query_continue=None, auth=None, continuation=False,
-                   **params):
+                   request_params={}, **params):
         """Makes an API request with the POST method
 
         :Parameters:
@@ -210,4 +234,5 @@ class AsyncSession:
         """
         return await self.request("POST", params=params, auth=auth,
                                   query_continue=query_continue,
-                                  continuation=continuation)
+                                  continuation=continuation,
+                                  **request_params)
